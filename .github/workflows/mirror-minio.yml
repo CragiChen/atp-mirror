@@ -72,6 +72,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 诊断 Docker Hub 源镜像（区分仓库不存在 / tag 被删 / 限流）
+        run: |
+          set +e   # 诊断步本身失败不应中断 job，结果仍写进 annotation
+          TOK="$(curl -sS 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:minio/minio:pull' \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))')"
+          CODE="$(curl -sS -o /tmp/m.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOK" \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
+            "https://registry-1.docker.io/v2/minio/minio/manifests/$MINIO_TAG")"
+          echo "::notice::manifest 状态=$CODE 响应=$(head -c 180 /tmp/m.json | tr '\n' ' ')"
+          TL="$(curl -sS -o /tmp/t.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOK" \
+            'https://registry-1.docker.io/v2/minio/minio/tags/list?n=100')"
+          echo "::notice::tags/list 状态=$TL 样例=$(python3 -c 'import json;print(", ".join(json.load(open("/tmp/t.json")).get("tags",[])[-6:]))' 2>/dev/null | head -c 180)"
+
       - name: 拉取 arm64 镜像并推送到 GHCR
         id: copy
         run: |
