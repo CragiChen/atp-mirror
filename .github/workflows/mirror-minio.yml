@@ -4,11 +4,13 @@
 # 背景（T-S0-03-REC §13.9）：
 #   * 本机与内网中转机都在受限出口，registry-1.docker.io:443 被 TCP 层阻断；
 #   * 国内公共镜像站只缓存 library/*，minio/minio 命名空间 403/404；
-#   * 但 **ghcr.io 在本机可达**（匿名 token endpoint 返回 200 + token ✓）。
+#   * 但 **ghcr.io 在本机可达**（匿名 token 200 + 公开镜像 manifest 200 ✓）。
 #
-# 做法：GitHub Actions 的 runner 有境外出口，用 buildx imagetools 把
-#   **整个多架构 manifest list**（含 linux/arm64）从 Docker Hub 复制到 GHCR。
-#   不逐层下载、不丢平台，本机再按 arm64 拉取。
+# 做法：GitHub Actions 的 runner 有境外出口，直接 pull arm64 镜像再 push 到 GHCR。
+#   （初版用 buildx imagetools create 复制 manifest list，实跑失败；
+#     改为真正把层推上去，最可靠且本机只需 arm64 ✓）
+#   失败时把错误写进 ::error:: annotation —— 公开仓库的 annotations 可匿名读，
+#   这样本机无需 API token 也能看到失败原因 ✓。
 #
 # ⚠️ 使用前必做：把推送出来的 GHCR package 的可见性设为 **Public**，
 #    否则本机匿名 pull 会 401（GITHUB_TOKEN 推送的包默认是 private）。
@@ -70,16 +72,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 安装 buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: 复制完整多架构 manifest list 到 GHCR
+      - name: 拉取 arm64 镜像并推送到 GHCR
         id: copy
         run: |
+          SRC="${{ env.SRC }}:$MINIO_TAG"
           DST="ghcr.io/${{ github.repository_owner }}/${{ env.DST_NAME }}:$MINIO_TAG"
-          docker buildx imagetools create \
-            --tag "$DST" \
-            "${{ env.SRC }}:$MINIO_TAG"
+          echo "源: $SRC"
+          echo "目标: $DST"
+          fail() { MSG="${1//$'\n'/%0A}"; echo "::error::${MSG:0:900}"; echo "$1"; exit 1; }
+          OUT="$(docker pull --platform linux/arm64 "$SRC" 2>&1)" || fail "docker pull 失败: $OUT"
+          echo "$OUT"
+          docker tag "$SRC" "$DST"
+          OUT="$(docker push "$DST" 2>&1)" || fail "docker push 失败: $OUT"
+          echo "$OUT"
           echo "dst=$DST" >> "$GITHUB_OUTPUT"
 
       - name: 输出 digest 供本机校验
