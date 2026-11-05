@@ -1,0 +1,105 @@
+# =============================================================================
+# T-S0-03b：把 Docker Hub 的 MinIO 镜像中转进 GHCR
+#
+# 背景（T-S0-03-REC §13.9）：
+#   * 本机与内网中转机都在受限出口，registry-1.docker.io:443 被 TCP 层阻断；
+#   * 国内公共镜像站只缓存 library/*，minio/minio 命名空间 403/404；
+#   * 但 **ghcr.io 在本机可达**（匿名 token endpoint 返回 200 + token ✓）。
+#
+# 做法：GitHub Actions 的 runner 有境外出口，用 buildx imagetools 把
+#   **整个多架构 manifest list**（含 linux/arm64）从 Docker Hub 复制到 GHCR。
+#   不逐层下载、不丢平台，本机再按 arm64 拉取。
+#
+# ⚠️ 使用前必做：把推送出来的 GHCR package 的可见性设为 **Public**，
+#    否则本机匿名 pull 会 401（GITHUB_TOKEN 推送的包默认是 private）。
+#    https://github.com/users/<OWNER>/packages/container/minio/settings
+#
+# 触发方式：① workflow 文件被 push 时自动跑一次；② 也可在 Actions 页手动 Run。
+# 目标仓库建议是**新建的空公开仓库**：GHCR package 默认继承仓库可见性，
+# 公开仓库推出来的包才能被本机匿名 pull ✓。
+#
+# 本仓库**只需这一个文件**：期望 tag 直接写在下面的 EXPECTED_TAG 常量里，
+# 不复制主仓库的 docker-compose.yml —— 那个文件含 ${VAR:-默认口令} 形态的
+# 开发默认值，推到公开仓库会暴露凭据 ✓。
+# tag 一致性由本机侧确认：主仓库 docker-compose.yml 里的 tag 必须等于 EXPECTED_TAG。
+# =============================================================================
+name: mirror-minio-to-ghcr
+
+on:
+  # 首次把本文件推到**新建的空公开仓库**时自动跑一次 ——
+  # 这样不需要额外的 API token 去触发 workflow_dispatch。
+  # 之后只有本文件变更才会再跑，不会因普通提交反复推镜像。
+  push:
+    paths:
+      - '.github/workflows/mirror-minio.yml'
+  workflow_dispatch:
+    inputs:
+      minio_tag:
+        description: 'MinIO 镜像 tag（必须与 docker-compose.yml 一致）'
+        required: true
+        default: 'RELEASE.2024-10-13T13-34-11Z'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SRC: docker.io/minio/minio
+  DST_NAME: minio
+  # 必须与主仓库 docker-compose.yml 里 minio/minio 的 tag 一致
+  EXPECTED_TAG: RELEASE.2024-10-13T13-34-11Z
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      # push 触发时 inputs 为空，必须给默认值，否则 tag 会是空串（实测设计缺陷）
+      - name: 解析 tag（兼容 push / 手动两种触发）
+        run: |
+          TAG="${{ inputs.minio_tag || env.EXPECTED_TAG }}"
+          echo "MINIO_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "本次中转 tag: $TAG"
+          echo "期望 tag（与主仓库 compose 对齐）: ${{ env.EXPECTED_TAG }}"
+          [ "$TAG" = "${{ env.EXPECTED_TAG }}" ] \
+            || { echo "::error::传入 tag 与 EXPECTED_TAG 不一致，别中转一个用不上的版本"; exit 1; }
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 复制完整多架构 manifest list 到 GHCR
+        id: copy
+        run: |
+          DST="ghcr.io/${{ github.repository_owner }}/${{ env.DST_NAME }}:$MINIO_TAG"
+          docker buildx imagetools create \
+            --tag "$DST" \
+            "${{ env.SRC }}:$MINIO_TAG"
+          echo "dst=$DST" >> "$GITHUB_OUTPUT"
+
+      - name: 输出 digest 供本机校验
+        run: |
+          DST="${{ steps.copy.outputs.dst }}"
+          DIGEST="$(docker buildx imagetools inspect "$DST" 2>/dev/null | grep -m1 '^Digest:' | awk '{print $2}' || true)"
+          {
+            echo "## 中转完成"
+            echo ""
+            echo "- 目标镜像：\`$DST\`"
+            echo "- manifest digest：\`${DIGEST:-（用 docker buildx imagetools inspect 查看）}\`"
+            echo ""
+            echo "### 本机侧"
+            echo '```bash'
+            echo "OWNER=${{ github.repository_owner }}"
+            echo "TAG=$MINIO_TAG"
+            echo 'docker pull --platform linux/arm64 ghcr.io/$OWNER/minio:$TAG'
+            echo 'docker tag ghcr.io/$OWNER/minio:$TAG docker.m.daocloud.io/minio/minio:$TAG'
+            echo 'docker compose --env-file deploy/.env up -d'
+            echo '```'
+            echo ""
+            echo "> 记得先把 GHCR package 可见性设为 **Public**。"
+          } >> "$GITHUB_STEP_SUMMARY"
